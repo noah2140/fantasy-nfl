@@ -557,6 +557,20 @@ async function get(url) {
     S.debug.counters.failed++;
     dbg(`FETCH #${requestId} ✗ proxy exception`, String(e));
   }
+
+  // Last fallback: second proxy (corsproxy.io often blocks deployed sites)
+  try {
+    const r = await fetch('https://api.allorigins.win/raw?url=' + encodeURIComponent(url), {cache:'no-store'});
+    if (r.ok) {
+      S.debug.counters.ok++;
+      const data = await r.json();
+      dbg(`FETCH #${requestId} ✓ allorigins ${r.status}`, url);
+      return data;
+    }
+    dbg(`FETCH #${requestId} ✗ allorigins HTTP ${r.status}`, url);
+  } catch(e) {
+    dbg(`FETCH #${requestId} ✗ allorigins exception`, String(e));
+  }
   return null;
 }
 
@@ -604,43 +618,119 @@ function setUpd() {
   if(el) el.textContent=new Date().toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
 }
 
-// LOAD PLAYERS – from all 32 team rosters
 // ═══════════════════════════════════════════
+// LOAD PLAYERS – from all 32 team rosters
+// (robust: 2 hosts, retries, cache, no fake fallback players)
+// ═══════════════════════════════════════════
+const ROSTER_HOSTS = [
+  'https://site.api.espn.com/apis/site/v2/sports/football/nfl',
+  'https://site.web.api.espn.com/apis/site/v2/sports/football/nfl'
+];
+const POOL_KEY = `ff_player_pool_${SEASON}`;
+
+// Tries both ESPN hosts (each direct + corsproxy via get()), 2 rounds
+// Handles every known response shape: {athletes:[…]}, {team:{athletes:[…]}},
+// and grouped lists [{position:'offense', items:[…]}, …]
+function extractAthletes(d) {
+  let list = d?.athletes || d?.team?.athletes || [];
+  if (!Array.isArray(list)) return [];
+  if (list.length && list[0] && Array.isArray(list[0].items)) list = list.flatMap(g => g.items || []);
+  return list;
+}
+
+let lastRosterDiag = '';
+
+async function fetchTeamRoster(tid) {
+  const urls = [];
+  for (const host of ROSTER_HOSTS) {
+    urls.push(`${host}/teams/${tid}/roster`);
+    urls.push(`${host}/teams/${tid}?enable=roster`);
+  }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    for (const url of urls) {
+      const d = await get(url);
+      if (extractAthletes(d).length) return d;
+      lastRosterDiag = d
+        ? `${url.replace('https://','')} → Antwort ohne Spielerliste (Keys: ${Object.keys(d).slice(0,8).join(', ')})`
+        : `${url.replace('https://','')} → keine Antwort (Netzwerk/CORS/Proxy)`;
+    }
+    await new Promise(r => setTimeout(r, 400));
+  }
+  return null;
+}
+
+function parseRoster(data, abbr, out) {
+  const athletes = extractAthletes(data);
+  for (const a of athletes) {
+    const pos = FANTASY_POS[a?.position?.abbreviation || ''];
+    if (!pos) continue; // skip non-fantasy positions (OL, LB, S, CB etc.)
+    out.push({
+      id: String(a.id),
+      name: a.displayName || a.fullName || '',
+      pos,
+      team: abbr,
+      img: `https://a.espncdn.com/i/headshots/nfl/players/full/${a.id}.png`,
+      pts: 0, stats: {}, game: null, gamelog: null,
+      isDefense: false, injury: null
+    });
+  }
+}
+
 async function loadPlayers() {
   setResults('<div class="loading">Lade NFL Spieler …</div>');
-  const all = [];
-  const BATCH = 8;
+  const all = [], failed = [];
+  const BATCH = 4; // fewer parallel requests → fewer rate-limit failures
+
   for (let i = 0; i < TEAM_IDS.length; i += BATCH) {
-    const batch = TEAM_IDS.slice(i, i+BATCH);
-    const res = await Promise.allSettled(batch.map(tid =>
-      get(`${SITE}/teams/${tid}?enable=roster`)
-    ));
-    res.forEach((r, j) => {
-      if (r.status !== 'fulfilled' || !r.value) return;
-      const abbr = TEAM_ABBR[batch[j]] || '??';
-      parseRoster(r.value, abbr, all);
-    });
-    setResults(`<div class="loading">Lade … ${Math.min(i+BATCH,32)}/32 Teams</div>`);
+    const batch = TEAM_IDS.slice(i, i + BATCH);
+    const res = await Promise.all(batch.map(async tid => ({ tid, data: await fetchTeamRoster(tid) })));
+    for (const { tid, data } of res) {
+      const abbr = TEAM_ABBR[tid] || '??';
+      if (data) parseRoster(data, abbr, all); else failed.push(abbr);
+    }
+    setResults(`<div class="loading">Lade … ${Math.min(i + BATCH, TEAM_IDS.length)}/${TEAM_IDS.length} Teams</div>`);
   }
 
-  // Add one DEF entry per team
-  Object.values(TEAM_ABBR).forEach(abbr => {
-    all.push({
-      id: `def_${abbr}`,
-      name: `${abbr} D/ST`,
-      pos: 'DEF',
-      team: abbr,
-      img: `https://a.espncdn.com/i/teamlogos/nfl/500/${abbr.toLowerCase()}.png`,
-      pts:0, stats:{}, game:null, gamelog:null, isDefense:false, injury:null,
-    });
-  });
+  // Fill failed teams from the last complete load
+  let cached = [];
+  try { cached = JSON.parse(localStorage.getItem(POOL_KEY) || '{}').players || []; } catch (e) {}
+  let stillMissing = [...failed];
+  if (failed.length && cached.length) {
+    const fs = new Set(failed);
+    cached.filter(p => fs.has(p.team)).forEach(p => all.push(p));
+    stillMissing = failed.filter(t => !cached.some(p => p.team === t));
+  }
 
-  if (all.length < 50) { useFallback(); return; }
-  S.players = all;
+  // Only a complete load (real players, D/ST not counted) is cached
+  if (!failed.length && all.length >= 300) {
+    try { localStorage.setItem(POOL_KEY, JSON.stringify({ t: Date.now(), players: all })); } catch (e) {}
+  }
+
+  // Remove duplicates
+  const seen = new Set();
+  const players = all.filter(p => !seen.has(p.id) && seen.add(p.id));
+
+  // One D/ST entry per team
+  Object.values(TEAM_ABBR).forEach(abbr => players.push({
+    id: `def_${abbr}`, name: `${abbr} D/ST`, pos: 'DEF', team: abbr,
+    img: `https://a.espncdn.com/i/teamlogos/nfl/500/${abbr.toLowerCase()}.png`,
+    pts: 0, stats: {}, game: null, gamelog: null, isDefense: true, injury: null
+  }));
+
+  S.players = players;
+  dbg('SPIELER GELADEN', { echteSpieler: players.length - 32, teamsFehlgeschlagen: failed, nochFehlend: stillMissing });
+
   await loadInjuries();
   mergeRoster();
   applyFilter();
   setUpd();
+
+  if (stillMissing.length) {
+    document.getElementById('results').insertAdjacentHTML('afterbegin',
+      `<div class="err">⚠️ ${stillMissing.length} Team(s) konnten nicht geladen werden: ${stillMissing.join(', ')}. ` +
+      `Mit „↻ Refresh" erneut versuchen.` +
+      (lastRosterDiag ? `<br><small>Letzter Versuch: ${escapeHtml(lastRosterDiag)}</small>` : '') + `</div>`);
+  }
 }
 
 function normalizeInjury(raw){
@@ -682,24 +772,6 @@ async function loadInjuries(){
   S.injuryMap=map;
   S.players.forEach(p=>{if(map[String(p.id)])p.injury=map[String(p.id)];});
   S.roster.forEach(p=>{if(map[String(p.id)])p.injury=map[String(p.id)];});
-}
-
-function parseRoster(data, abbr, out) {
-  // ?enable=roster → data.team.athletes (flat array)
-  const athletes = data?.team?.athletes || [];
-  for (const a of athletes) {
-    const rawPos = a?.position?.abbreviation || '';
-    const pos = FANTASY_POS[rawPos];
-    if (!pos) continue; // skip non-fantasy positions (OL, LB, S, CB etc.)
-    out.push({
-      id: String(a.id),
-      name: a.displayName || a.fullName || '',
-      pos,
-      team: abbr,
-      img: `https://a.espncdn.com/i/headshots/nfl/players/full/${a.id}.png`,
-      pts:0, stats:{}, game:null, gamelog:null, isDefense:true, injury:null,
-    });
-  }
 }
 
 // ═══════════════════════════════════════════
@@ -1620,7 +1692,7 @@ function renderWeeklyLeaders(rows,week){
 
 function applyFilter() {
   const q = S.query.toLowerCase().trim();
-  let pool = S.players.length ? S.players : FALLBACK;
+  let pool = S.players;
   if (S.posFilter !== 'ALL') pool = pool.filter(p => p.pos === S.posFilter);
   if (q) pool = pool.filter(p => p.name.toLowerCase().includes(q) || p.team.toLowerCase().includes(q));
   const show = q ? pool.slice(0,80) : [...pool].sort((a,b)=>a.name.localeCompare(b.name)).slice(0,50);
@@ -1665,7 +1737,7 @@ function switchRoster(id){saveRosterState();if(!S.rosters.some(r=>r.id===id))ret
 function createRoster(){const name=(prompt('Name für das neue Roster:',`Roster ${S.rosters.length+1}`)||'').trim();if(!name)return;saveRosterState();const r={id:makeRosterId(),name,players:[]};S.rosters.push(r);S.activeRosterId=r.id;setActiveRosterRef();saveRosterState();renderRoster();countBadge();applyFilter();}
 function renameRoster(){const r=S.rosters.find(x=>x.id===S.activeRosterId);if(!r)return;const name=(prompt('Neuer Name für das Roster:',r.name)||'').trim();if(!name)return;r.name=name;saveRosterState();renderRosterSelector();renderRoster();}
 function deleteRoster(){if(S.rosters.length<=1){alert('Mindestens ein Roster muss vorhanden sein.');return;}const r=S.rosters.find(x=>x.id===S.activeRosterId);if(!r)return;if(!confirm(`Roster „${r.name}“ wirklich löschen?`))return;const i=S.rosters.findIndex(x=>x.id===r.id);S.rosters.splice(i,1);S.activeRosterId=S.rosters[Math.max(0,i-1)].id;setActiveRosterRef();saveRosterState();renderRoster();countBadge();applyFilter();fetchScores();}
-function togglePlayer(id){const i=S.roster.findIndex(p=>p.id===id);if(i>=0)S.roster.splice(i,1);else{const p=(S.players.length?S.players:FALLBACK).find(p=>p.id===id);if(p)S.roster.push({...p,active:true,stats:{},game:null});}save();countBadge();applyFilter();renderRoster();}
+function togglePlayer(id){const i=S.roster.findIndex(p=>p.id===id);if(i>=0)S.roster.splice(i,1);else{const p=S.players.find(p=>p.id===id);if(p)S.roster.push({...p,active:true,stats:{},game:null});}save();countBadge();applyFilter();renderRoster();}
 function removePlayer(id){const r=S.rosters.find(x=>x.id===S.activeRosterId);if(!r)return;const before=r.players.length;r.players=r.players.filter(p=>String(p.id)!==String(id));S.roster=r.players;if(r.players.length===before)return;saveRosterState();countBadge();applyFilter();renderRoster();}
 function setPlayerActive(id,active){const p=S.roster.find(x=>x.id===id);if(!p)return;p.active=!!active;save();renderRoster();}
 function save(){saveRosterState();}
@@ -1925,39 +1997,6 @@ document.getElementById('debug-clear').addEventListener('click', () => {
 document.getElementById('debug-bg').addEventListener('click', e => {
   if (e.target.id === 'debug-bg') e.target.classList.add('hidden');
 });
-
-// ═══════════════════════════════════════════
-// FALLBACK PLAYERS
-// ═══════════════════════════════════════════
-const FALLBACK = [
-  {id:'3054211',name:'Lamar Jackson',pos:'QB',team:'BAL',img:'https://a.espncdn.com/i/headshots/nfl/players/full/3054211.png',pts:0,stats:{}},
-  {id:'4361259',name:'Josh Allen',pos:'QB',team:'BUF',img:'https://a.espncdn.com/i/headshots/nfl/players/full/4361259.png',pts:0,stats:{}},
-  {id:'4040715',name:'Jalen Hurts',pos:'QB',team:'PHI',img:'https://a.espncdn.com/i/headshots/nfl/players/full/4040715.png',pts:0,stats:{}},
-  {id:'3139477',name:'Patrick Mahomes',pos:'QB',team:'KC',img:'https://a.espncdn.com/i/headshots/nfl/players/full/3139477.png',pts:0,stats:{}},
-  {id:'4258173',name:'Joe Burrow',pos:'QB',team:'CIN',img:'https://a.espncdn.com/i/headshots/nfl/players/full/4258173.png',pts:0,stats:{}},
-  {id:'4035004',name:'C.J. Stroud',pos:'QB',team:'HOU',img:'https://a.espncdn.com/i/headshots/nfl/players/full/4035004.png',pts:0,stats:{}},
-  {id:'4429013',name:'Brock Purdy',pos:'QB',team:'SF',img:'https://a.espncdn.com/i/headshots/nfl/players/full/4429013.png',pts:0,stats:{}},
-  {id:'3054789',name:'Christian McCaffrey',pos:'RB',team:'SF',img:'https://a.espncdn.com/i/headshots/nfl/players/full/3054789.png',pts:0,stats:{}},
-  {id:'4360438',name:'Saquon Barkley',pos:'RB',team:'PHI',img:'https://a.espncdn.com/i/headshots/nfl/players/full/4360438.png',pts:0,stats:{}},
-  {id:'4259545',name:"De'Von Achane",pos:'RB',team:'MIA',img:'https://a.espncdn.com/i/headshots/nfl/players/full/4259545.png',pts:0,stats:{}},
-  {id:'4036378',name:"Ja'Marr Chase",pos:'WR',team:'CIN',img:'https://a.espncdn.com/i/headshots/nfl/players/full/4036378.png',pts:0,stats:{}},
-  {id:'4262921',name:'CeeDee Lamb',pos:'WR',team:'DAL',img:'https://a.espncdn.com/i/headshots/nfl/players/full/4262921.png',pts:0,stats:{}},
-  {id:'4361141',name:'Tyreek Hill',pos:'WR',team:'MIA',img:'https://a.espncdn.com/i/headshots/nfl/players/full/4361141.png',pts:0,stats:{}},
-  {id:'4047650',name:'Justin Jefferson',pos:'WR',team:'MIN',img:'https://a.espncdn.com/i/headshots/nfl/players/full/4047650.png',pts:0,stats:{}},
-  {id:'3054212',name:'Travis Kelce',pos:'TE',team:'KC',img:'https://a.espncdn.com/i/headshots/nfl/players/full/3054212.png',pts:0,stats:{}},
-  {id:'4379371',name:'Sam LaPorta',pos:'TE',team:'DET',img:'https://a.espncdn.com/i/headshots/nfl/players/full/4379371.png',pts:0,stats:{}},
-  {id:'3054220',name:'Harrison Butker',pos:'K',team:'KC',img:'https://a.espncdn.com/i/headshots/nfl/players/full/3054220.png',pts:0,stats:{}},
-  {id:'def_SF',name:'SF D/ST',pos:'DEF',team:'SF',img:'https://a.espncdn.com/i/teamlogos/nfl/500/sf.png',pts:0,stats:{}},
-  {id:'def_BAL',name:'BAL D/ST',pos:'DEF',team:'BAL',img:'https://a.espncdn.com/i/teamlogos/nfl/500/bal.png',pts:0,stats:{}},
-  {id:'def_KC',name:'KC D/ST',pos:'DEF',team:'KC',img:'https://a.espncdn.com/i/teamlogos/nfl/500/kc.png',pts:0,stats:{}},
-];
-
-function useFallback() {
-  document.getElementById('results').insertAdjacentHTML('afterbegin',
-    '<div class="err">⚠️ ESPN-API nicht erreichbar – Demo-Spieler aktiv. Bitte im WLAN erneut versuchen (Reload).</div>');
-  S.players = FALLBACK;
-  mergeRoster(); applyFilter();
-}
 
 // ═══════════════════════════════════════════
 // INIT
